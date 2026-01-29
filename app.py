@@ -4,23 +4,27 @@ import numpy as np
 import pandas as pd
 from datetime import datetime
 from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration
+import threading
+import time
 
-# ---------------------------------------
-# Config for WebRTC
+# -----------------------------
+# WebRTC config for browser camera
 RTC_CONFIGURATION = RTCConfiguration(
     {"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}
 )
 
-# ---------------------------------------
+# -----------------------------
 # Load face detection
-face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+face_cascade = cv2.CascadeClassifier(
+    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+)
 
 # Load face recognition model
 try:
     recognizer = cv2.face.LBPHFaceRecognizer_create()
     recognizer.read("models/face_model.yml")
     label_map = np.load("models/labels.npy", allow_pickle=True).item()
-except Exception as e:
+except:
     st.error("Face recognition model not found. Please train first.")
     st.stop()
 
@@ -30,15 +34,17 @@ try:
 except:
     df = pd.DataFrame(columns=["Name", "Action", "Time"])
 
-# Keep track of last action
+# Keep track of last action per person
 last_action = {}
+lock = threading.Lock()
 
-# ---------------------------------------
-# Video Transformer for Streamlit WebRTC
+# -----------------------------
+# Video transformer class
 class FaceAttendance(VideoTransformerBase):
     def __init__(self):
         self.df = df
         self.last_action = last_action
+        self.last_time = {}
 
     def transform(self, frame):
         img = frame.to_ndarray(format="bgr24")
@@ -48,47 +54,51 @@ class FaceAttendance(VideoTransformerBase):
         for (x, y, w, h) in faces:
             face = gray[y:y+h, x:x+w]
             label, confidence = recognizer.predict(face)
+
             if confidence < 70:
                 name = label_map[label]
-                current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-                # Punch in / out logic
-                if name not in self.last_action or self.last_action[name] == "OUT":
-                    action = "IN"
-                    self.last_action[name] = "IN"
-                else:
-                    action = "OUT"
-                    self.last_action[name] = "OUT"
+                now = datetime.now()
+                # Avoid duplicate punches within 5 seconds
+                if name not in self.last_time or (now - self.last_time[name]).seconds > 5:
+                    # Determine action
+                    if name not in self.last_action or self.last_action[name] == "OUT":
+                        action = "IN"
+                        self.last_action[name] = "IN"
+                    else:
+                        action = "OUT"
+                        self.last_action[name] = "OUT"
 
-                # Append to dataframe
-                new_row = {"Name": name, "Action": action, "Time": current_time}
-                self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
-                self.df.to_csv("attendance.csv", index=False)
+                    self.last_time[name] = now
 
-                # Display text on frame
-                text = f"{name} - Punch {action}"
-                cv2.putText(img, text, (x, y-10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+                    # Append to dataframe
+                    with lock:
+                        new_row = {"Name": name, "Action": action, "Time": now.strftime("%Y-%m-%d %H:%M:%S")}
+                        self.df = pd.concat([self.df, pd.DataFrame([new_row])], ignore_index=True)
+                        self.df.to_csv("attendance.csv", index=False)
+
+                    # Put text on frame
+                    cv2.putText(img, f"{name} - Punch {action}", (x, y-10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
             cv2.rectangle(img, (x, y), (x+w, y+h), (0, 255, 0), 2)
 
         return img
 
-# ---------------------------------------
+# -----------------------------
 # Streamlit UI
 st.title("🟢 Face Recognition Attendance System")
-st.write("Automatically punch IN / OUT when face is detected")
+st.write("Automatically punches IN / OUT when a registered face is detected.")
 
-# Run WebRTC
+# WebRTC streamer
 webrtc_ctx = webrtc_streamer(
     key="attendance",
     video_transformer_factory=FaceAttendance,
     rtc_configuration=RTC_CONFIGURATION,
     media_stream_constraints={"video": True, "audio": False},
-    async_transform=True
+    async_transform=True,
 )
 
 # Show live attendance table
 st.subheader("Attendance Records")
 st.dataframe(df)
-
-
